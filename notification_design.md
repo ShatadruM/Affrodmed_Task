@@ -867,3 +867,146 @@ Cache key pattern: "notif_list:{student_id}:{category}:{isRead}:{page}"
 Invalidate on:     INSERT into student_notifications for student_id
                    UPDATE student_notifications SET is_read = TRUE
 ```
+
+# Stage 3
+ 
+## Query Review & Optimisation
+ 
+the query: 
+ 
+```sql
+SELECT * FROM notifications
+WHERE studentID = 1042 AND isRead = false
+ORDER BY createdAt DESC;
+```
+ 
+Let's walk thru what's wrong with it
+ 
+---
+ 
+## Is This Query Accurate?
+ 
+Sort of but it has a design problem baked in before we even get to performance.
+ 
+The query assumes `studentID` and `isRead` sit directly inside the `notifications` table. That means every time a notification goes out to 50,000 students, the database stores 50,000 nearly identical rows — same title, same body, same attachments — just with a different `studentID`. So if someone spots a typo in a notification body, you'd have to update 50,000 rows to fix it. That's messy.
+ 
+The cleaner approach (which we set up in Stage 2) is to store the notification content once in `notifications`, and track per-student state, read/unread, delivery timestamp in a separate `student_notifications` table. That way content lives in one place and per-student data lives in another.
+ 
+That said, the problem gives us this flat schema to work with, so the rest of the analysis treats it as-is.
+ 
+---
+ 
+## Why Is It Slow?
+ 
+Three things are hitting the query at the same time:
+ 
+**1. It's doing a full table scan**
+ 
+There's no index on `studentID` or `isRead`, so the database has no shortcut it reads through all 5 million rows one by one looking for matches. Even if student 1042 only has 30 notifications, the database doesn't know that until it's checked every single row. That's O(N) for every request.
+ 
+**2. `SELECT *` pulls more data than anyone needs**
+ 
+The notification list view only needs a handful of fields, maybe `id`, `title`, `summary`, and `createdAt`. But `SELECT *` drags along everything: the full notification body, attachments, and any other columns. All that extra data has to be read from disk, loaded into memory, and sent over the network, for every row, every time.
+ 
+**3. Sorting without an index forces a filesort**
+ 
+Because `createdAt` isn't indexed, the database can't return rows in sorted order directly. It has to gather all the matching rows first and then sort them in memory if they're few enough, or spilling to disk if there are too many. Either way, it's extra work that an index would eliminate entirely.
+ 
+---
+ 
+## What Would You Change?
+ 
+**First — Wont use `SELECT *`**
+ 
+Only ask for what the UI actually needs:
+ 
+```sql
+SELECT id, title, summary, createdAt
+FROM notifications
+WHERE studentID = 1042 AND isRead = false
+ORDER BY createdAt DESC;
+```
+ 
+This alone reduces how much data the database reads and sends back on every call.
+ 
+**Second — add the right index**
+ 
+A composite index on `(studentID, isRead, createdAt DESC)` lets the database jump straight to student 1042's unread rows and return them pre-sorted, with no table scan and no filesort:
+ 
+```sql
+CREATE INDEX idx_notifications_student_unread
+ON notifications(studentID, isRead, createdAt DESC);
+```
+ 
+**Third — go even leaner with a partial index**
+ 
+Since this query almost always runs with `isRead = false`, we can build an index that only covers unread rows. It's smaller, faster to search, and as students read notifications those rows automatically fall out of the index:
+ 
+```sql
+CREATE INDEX idx_notifications_unread_by_student
+ON notifications(studentID, createdAt DESC)
+WHERE isRead = false;
+```
+ 
+### How much does this actually help?
+ 
+| Approach | What happens | Cost |
+|---|---|---|
+| No index (current) | Scans all 5M rows every time | O(N) |
+| Composite index | Jumps to the right rows, sort is free | O(log N + K) |
+| Partial index (unread only) | Same but index is much smaller | O(log M + K), M << N |
+ 
+K is the number of unread notifications for that student — usually a small number. The difference between the first and last row is enormous in practice.
+ 
+---
+ 
+## Should You Index Every Column?
+ 
+No, and this suggestion would actually make things worse.
+ 
+The idea that "more indexes = faster queries" is a common misconception. Indexes do speed up reads, but every index you add has to be updated on every write. In a notifications platform, writes are constant students are marking things as read all day, and new notifications are being inserted in bulk. With an index on every column, each of those writes becomes several writes under the hood, one per index.
+ 
+On a 5M-row table with wide columns like notification body and attachments, indexing everything could easily double or triple your storage footprint too. And PostgreSQL has to keep all those indexes in sync during maintenance operations like `VACUUM` and `ANALYZE`, which adds background load.
+ 
+The right call is to index only what your queries actually filter, sort, or join on. For this table, three indexes cover everything you need:
+ 
+```sql
+-- The main one: fast unread fetch per student
+CREATE INDEX idx_notifications_unread_by_student
+ON notifications(studentID, createdAt DESC)
+WHERE isRead = false;
+ 
+-- For cases where you need all notifications (read + unread)
+CREATE INDEX idx_notifications_student_created
+ON notifications(studentID, createdAt DESC);
+ 
+-- For filtering by notification type
+CREATE INDEX idx_notifications_type_created
+ON notifications(notificationType, createdAt DESC);
+```
+ 
+Columns like `body`, `title`, and `attachments` don't need indexes because nobody filters by them.
+ 
+---
+ 
+## Students Who Got a Placement Notification in the Last 7 Days
+ 
+```sql
+SELECT DISTINCT studentID
+FROM notifications
+WHERE notificationType = 'Placement'
+  AND createdAt >= NOW() - INTERVAL '7 days';
+```
+ 
+`DISTINCT` is there because a student might have received more than one placement notification in the window — we only want them listed once. The `idx_notifications_type_created` index we defined above means the database can jump straight to `'Placement'` rows in the last 7 days without touching the rest of the table.
+ 
+If you need names and emails alongside the IDs — for sending a follow-up email, for example:
+ 
+```sql
+SELECT DISTINCT n.studentID, s.name, s.email, s.department
+FROM notifications n
+JOIN students s ON s.id = n.studentID
+WHERE n.notificationType = 'Placement'
+  AND n.createdAt >= NOW() - INTERVAL '7 days'
+ORDER BY s.name ASC;
+``` 
