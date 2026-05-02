@@ -1252,3 +1252,35 @@ worker app_push(job):
 ## Why This is Better
  
 The DB insert is instant and always succeeds independently of email. Workers run in parallel so 50,000 students get processed in minutes, not hours. Failed emails are automatically retried up to 3 times without affecting anyone else. If the whole system crashes midway, pending jobs survive in the queue and resume when the worker restarts. And there's a full audit trail of who got what and when.
+
+
+# Stage 6
+ 
+## Priority Inbox
+ 
+The goal is to always show the student their most important unread notifications first, not just the most recent ones. A placement drive deadline matters more than an event reminder, even if the event notification arrived later.
+ 
+### How Priority is Scored
+ 
+Each notification gets a score based on two things: its type and how recent it is.
+ 
+**Type weight** is fixed:
+- Placement = 3
+- Result = 2
+- Event = 1
+**Recency score** is normalized between 0 and 1 across all notifications in the current batch. The newest notification gets a score of 1, the oldest gets 0, everything else falls in between proportionally.
+ 
+**Final score:**
+```
+score = (typeWeight * 0.7) + (recencyScore * 0.3)
+```
+ 
+This gives type more influence than recency (70/30), so a placement notification from yesterday will still rank above a result notification from an hour ago. But if two notifications have the same type, the more recent one wins.
+ 
+### How the Top N is Selected
+ 
+Once scores are computed, a min-heap of size N keeps track of the top entries. For each incoming notification, if its score beats the lowest score currently in the heap, it replaces it. This runs in O(K log N) time where K is the total number of notifications and N is the inbox size — much better than sorting everything.
+ 
+### Keeping Up With New Notifications
+ 
+New notifications keep arriving, so the heap needs to stay current. The approach is to re-run the scoring and heap selection on each fetch. Since the API is the source of truth and we're not storing anything in a database, every call gets the latest snapshot and recomputes the top N from scratch. For a more real-time setup, new notifications coming in via the SSE stream (from Stage 1) can be scored on arrival and inserted into the heap directly, evicting the lowest scorer if the heap is full.
