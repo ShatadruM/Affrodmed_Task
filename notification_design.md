@@ -1010,3 +1010,96 @@ WHERE n.notificationType = 'Placement'
   AND n.createdAt >= NOW() - INTERVAL '7 days'
 ORDER BY s.name ASC;
 ``` 
+
+
+# Stage 4
+ 
+## Fixing the "Fetch on Every Page Load" Problem
+ 
+Right now, every time a student opens the app, the backend hits the database to fetch their notifications fresh. With 50,000 students doing this repeatedly throughout the day, the database is getting hammered with reads it doesn't need to be doing. Here's how to fix that.
+ 
+---
+ 
+## Strategy 1: Cache Notification Lists in Redis
+ 
+The most direct fix is to cache the notification list in Redis after the first fetch. On the next page load, the backend checks Redis first. If the data is there, it returns it without touching the database at all.
+ 
+```
+Student opens app
+  -> Check Redis for their notification list
+  -> Hit: return cached data (no DB query)
+  -> Miss: query DB, store result in Redis, return data
+```
+ 
+When a student marks a notification as read, or a new notification arrives, we delete their cache key so the next request gets fresh data.
+ 
+**Tradeoffs:**
+- Read load on the DB drops significantly since most page loads are served from cache
+- Adds operational complexity: you now have Redis to manage and monitor
+- If cache invalidation is missed for any reason, the student sees stale data until the TTL expires
+- Works best when notifications don't change frequently, which is true for this use case
+---
+ 
+## Strategy 2: Pagination Instead of Fetching Everything
+ 
+If the current query loads all notifications for a student at once, that's a lot of unnecessary data. Most students only look at the first page. Loading 200 notifications when they'll read 10 is wasteful.
+ 
+Switching to keyset pagination means each request only fetches the next small batch:
+ 
+```sql
+SELECT id, title, summary, createdAt
+FROM notifications
+WHERE studentID = $1
+  AND isRead = false
+  AND createdAt < $lastSeenCreatedAt
+ORDER BY createdAt DESC
+LIMIT 20;
+```
+ 
+The frontend requests more only when the user scrolls down.
+ 
+**Tradeoffs:**
+- Immediately reduces data transferred per request
+- Keyset pagination is faster than offset-based pagination at large page numbers since it uses the index directly
+- Requires the frontend to track the last seen cursor, which adds a small amount of state management
+---
+ 
+## Strategy 3: Serve Counts Instead of Full Lists on Page Load
+ 
+The page load doesn't necessarily need the full notification list right away. It just needs to show a badge with the unread count, then load the actual list only when the student clicks on it.
+ 
+```sql
+SELECT COUNT(*)
+FROM notifications
+WHERE studentID = $1 AND isRead = false;
+```
+ 
+This is a much cheaper query and can also be cached. The full list is fetched lazily, only when requested.
+ 
+**Tradeoffs:**
+- Dramatically reduces page load query cost
+- Students see the unread count immediately and the list loads a moment later, which is a common and accepted pattern
+- Requires a small UI change to support the deferred load
+---
+ 
+## Strategy 4: Push Updates Instead of Polling
+ 
+The deeper problem is that the frontend is pulling data on every page load because it has no way to know when something changed. If we push updates to the client instead, there's no reason to re-fetch on load at all.
+ 
+This is what the SSE stream in our Stage 1 design handles. When a new notification is dispatched, the server pushes it directly to connected students. The client updates its local state and the unread count badge without making a single new request.
+ 
+**Tradeoffs:**
+- Eliminates fetch-on-load entirely for active users
+- SSE connections are persistent and consume server memory, so connection limits need to be managed
+- Students who are offline when a notification arrives will still need to fetch on their next login, so this works alongside caching rather than replacing it
+---
+ 
+## What to Actually Do
+ 
+These strategies work best in combination, not in isolation. A reasonable rollout would be:
+ 
+1. Add Redis caching with a short TTL as an immediate fix since it requires the least frontend change
+2. Move to paginated fetching to reduce per-request payload size
+3. Use the SSE stream to push updates and eliminate unnecessary re-fetches for active sessions
+4. Serve only the unread count on initial load and fetch the list on demand
+Each step compounds on the previous one, and the DB load comes down significantly at every stage.
